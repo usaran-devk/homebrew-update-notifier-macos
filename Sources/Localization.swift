@@ -22,6 +22,11 @@ enum L10n {
         isGerman ? de : en
     }
 
+    // MARK: - App Name
+    /// The localized application name.
+    static var appName: String { localized("Koebes", "Köbes") }
+    static var appNameShortDescription: String { localized("Your Homebrew Update Manager", "Dein Homebrew-Aktualisierungsmanager") }
+
     // MARK: - State
 
     /// Strings describing the current update state.
@@ -29,6 +34,7 @@ enum L10n {
         static var upToDate: String { localized("All packages up to date", "Alle Pakete aktuell") }
         static var updatesAvailable: String { localized("Updates available", "Updates verfügbar") }
         static var checking: String { localized("Checking for updates…", "Suche nach Updates…") }
+        static var checkError: String { localized("Check for updates failed", "Prüfung auf Updates fehlgeschlagen") }
         static var updating: String { localized("Updating packages…", "Pakete werden aktualisiert…") }
         static var updateComplete: String { localized("Update finished", "Aktualisierung abgeschlossen") }
         static var updateCompletedWithErrors: String { localized("Update finished with errors", "Aktualisierung mit Fehlern abgeschlossen") }
@@ -43,12 +49,24 @@ enum L10n {
         static var selectAll: String { localized("Select All", "Alle auswählen") }
         static var deselectAll: String { localized("Deselect All", "Alle abwählen") }
         static var updateSelected: String { localized("Update Selected", "Ausgewählte aktualisieren") }
+        static var updateSelectedWithForce: String { localized("Update Selected with --force", "Ausgewählte mit --force erneut installieren") }
+        static var updateModePromptTitle: String { localized("Choose update mode", "Update-Modus wählen") }
+        static var updateModePromptMessage: String { localized("Install selected packages normally or force a reinstall with --force.", "Installiere die ausgewählten Pakete normal oder erzwinge eine Neuinstallation mit --force.") }
+        static var showRemaining: String { localized("Show Remaining", "Verbleibende anzeigen") }
         static var checkNow: String { localized("Check Now", "Jetzt prüfen") }
         static var settings: String { localized("Settings…", "Einstellungen…") }
         static var quit: String { localized("Quit", "Beenden") }
-        static var installedVersion: String { localized("Installed", "Installiert") }
-        static var availableVersion: String { localized("Available", "Verfügbar") }
         static var noUpdates: String { localized("No updates available.", "Keine Updates verfügbar.") }
+        static var dependencyTree: String { localized("Dependency Tree", "Abhängigkeitsbaum") }
+        static func dependencyTreeForType(_ typeLabel: String) -> String {
+            localized("\(dependencyTree): \(typeLabel)", "\(dependencyTree): \(typeLabel)")
+        }
+        static func dependencyCycleWarning(_ packages: String) -> String {
+            localized(
+                "Dependency cycle detected: \(packages). Order is best-effort.",
+                "Abhängigkeitszyklus erkannt: \(packages). Reihenfolge ist bestmöglich."
+            )
+        }
 
         /// Returns a localized display name for a given brew package type.
         /// - Parameter type: The raw type string (e.g. `Constants.PackageType.formula`).
@@ -90,6 +108,12 @@ enum L10n {
         static var passwordVerifyUnavailable: String { localized("Could not verify password — saving anyway.", "Passwort konnte nicht überprüft werden – wird trotzdem gespeichert.") }
         static var save: String { localized("Save", "Speichern") }
         static var cancel: String { localized("Cancel", "Abbrechen") }
+        static var sectionPermissions: String { localized("Permissions", "Berechtigungen") }
+        static var appManagementHint: String { localized(
+            "macOS requires App Management permission to update app bundles (casks such as Firefox, Docker, etc.). Click the button below, find Koebes in the list, and enable the toggle.",
+            "macOS benötigt die Berechtigung \"App-Verwaltung\", um App-Pakete (Casks wie Firefox, Docker usw.) zu aktualisieren. Klicke auf den Button, suche Köbes in der Liste und aktiviere den Schalter."
+        ) }
+        static var openAppManagementSettings: String { localized("Open App Management Settings…", "App-Verwaltung öffnen…") }
     }
 
     // MARK: - Error
@@ -97,8 +121,6 @@ enum L10n {
     /// Error message strings.
     enum Error {
         static var brewNotFound: String { localized("Homebrew not found", "Homebrew nicht gefunden") }
-        static var parseFailed: String { localized("Failed to parse update data", "Update-Daten konnten nicht gelesen werden") }
-        static var updateFailed: String { localized("Update failed", "Aktualisierung fehlgeschlagen") }
         static var savedPasswordInvalid: String { localized("Saved sudo password is no longer valid. Please save it again.", "Gespeichertes sudo-Passwort ist nicht mehr gültig. Bitte erneut speichern.") }
         static var savedPasswordUnavailable: String { localized("Could not verify saved sudo password. Please save it again.", "Gespeichertes sudo-Passwort konnte nicht überprüft werden. Bitte erneut speichern.") }
     }
@@ -107,11 +129,8 @@ enum L10n {
 
     /// Log output strings.
     enum Log {
-        static var updateStarted: String { localized("Starting update…", "Aktualisierung wird gestartet…") }
-        static var updateFinished: String { localized("Update finished.", "Aktualisierung abgeschlossen.") }
-        static var checkStarted: String { localized("Checking for updates…", "Suche nach Updates…") }
-        static var checkFinished: String { localized("Check finished.", "Prüfung abgeschlossen.") }
         static var checkDetails: String { localized("Details", "Details") }
+        static var lastChecked: String { localized("Last checked: ", "Zuletzt geprüft: ") }
     }
 
     // MARK: - Package Status

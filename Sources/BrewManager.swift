@@ -3,6 +3,8 @@ import Foundation
 /// Manages interaction with the `brew` command-line tool.
 ///
 /// Provides methods to check for outdated packages and to upgrade selected packages.
+/// Parsing logic lives in `BrewParser`, graph algorithms in `DependencyResolver`,
+/// and process execution in `ProcessRunner`.
 @MainActor
 final class BrewManager: ObservableObject {
 
@@ -17,16 +19,31 @@ final class BrewManager: ObservableObject {
     /// Set of selected package names for updating.
     @Published var selectedPackages: Set<String> = []
 
+    /// Direct dependencies between outdated packages (name -> direct deps).
+    @Published private(set) var dependencyGraph: [String: [String]] = [:]
+
     /// Per-package update results from the most recent update operation.
     @Published private(set) var updateResults: [PackageUpdateResult] = []
 
     /// Human-readable summary log from the most recent check operation.
     @Published private(set) var checkLog: String = ""
+    @Published private(set) var checkTime: Date?
 
     // MARK: - Private Properties
 
     /// Resolved path to the brew executable.
     private let brewPath: String?
+
+    /// Process runner used to launch brew subcommands.
+    private let processRunner = ProcessRunner()
+
+    /// True while an update workflow is active (preflight + upgrade execution).
+    private var isUpdateInProgress = false
+
+    #if DEBUG_MOCK
+    /// Toggles each update run: when `true` packages may fail randomly; when `false` all succeed.
+    private var mockFailureEnabled = false
+    #endif
 
     // MARK: - Initialization
 
@@ -51,78 +68,212 @@ final class BrewManager: ObservableObject {
     /// Checks for outdated homebrew packages.
     ///
     /// Sets `state` to `.checking` during the operation, then to `.upToDate`
-    /// or `.updatesAvailable` depending on results. On failure, sets `.error`.
+    /// or `.updatesAvailable` depending on results. On failure, sets `.checkError`.
     func checkForUpdates() async {
+        // Ignore background checks while another check/update is active to keep
+        // state transitions deterministic (for UI and dock icon behavior).
+        if isUpdateInProgress || state == .updating || state == .checking {
+            return
+        }
+
         #if DEBUG_MOCK
         state = .checking
         packages = []
         selectedPackages = []
+        dependencyGraph = [:]
         updateResults = []
         checkLog = ""
+        checkTime = Date()
 
         // Simulate network delay
         try? await Task.sleep(nanoseconds: 1_000_000_000)
 
-        packages = Constants.MockData.packages
-        selectedPackages = Set(packages.map { $0.name })
-        checkLog = BrewManager.buildCheckLog(updateOutput: Constants.MockData.brewUpdateOutput, outdatedOutput: Constants.MockData.brewOutdatedOutput)
-        state = .updatesAvailable
+        // Another operation may have changed state while this check was waiting.
+        guard state == .checking, !isUpdateInProgress else {
+            return
+        }
+
+        if Bool.random() {
+            // Each package has a 50% base chance of being selected.
+            // For any selected package, each of its dependencies gets an
+            // additional 50% chance to be pulled in as well.
+            var selectedNames = Set(Constants.MockData.packages
+                .filter { _ in Bool.random() }
+                .map { $0.name })
+            // Ensure at least one package is always selected
+            if selectedNames.isEmpty, let pick = Constants.MockData.packages.randomElement() {
+                selectedNames.insert(pick.name)
+            }
+            // Dependency bonus pass
+            for name in selectedNames {
+                for dep in Constants.MockData.dependencyGraph[name] ?? [] {
+                    if !selectedNames.contains(dep), Bool.random() {
+                        selectedNames.insert(dep)
+                    }
+                }
+            }
+            packages = Constants.MockData.packages.filter { selectedNames.contains($0.name) }
+            selectedPackages = Set(packages.map { $0.name })
+            dependencyGraph = Constants.MockData.dependencyGraph.filter { selectedNames.contains($0.key) }
+            checkLog = BrewParser.buildCheckLog(updateOutput: Constants.MockData.brewUpdateOutput, outdatedOutput: Constants.MockData.brewOutdatedOutput)
+            state = .updatesAvailable
+        } else {
+            // No updates available
+            packages = []
+            selectedPackages = []
+            dependencyGraph = [:]
+            checkLog = BrewParser.buildCheckLog(updateOutput: Constants.MockData.brewUpdateOutput, outdatedOutput: "")
+            state = .upToDate
+        }
         return
         #else
         guard let brewPath else {
-            state = .error(L10n.Error.brewNotFound)
+            state = .checkError(L10n.Error.brewNotFound)
             return
         }
 
         state = .checking
         packages = []
         selectedPackages = []
+        dependencyGraph = [:]
         updateResults = []
         checkLog = ""
-
         do {
-            // Fetch latest formula/cask definitions before checking
-            let updateOutput = try await runProcess(brewPath, arguments: Constants.Process.updateArgs)
+            // Fetch latest formula/cask definitions before checking.
+            let updateOutput = try await processRunner.run(brewPath, arguments: Constants.Process.updateArgs)
+            guard state == .checking, !isUpdateInProgress else {
+                return
+            }
+            if BrewParser.outputContainsError(updateOutput) {
+                setCheckErrorState(messageFrom: updateOutput, updateOutput: updateOutput, outdatedOutput: "")
+                return
+            }
 
             var outdatedArgs = Constants.Process.outdatedArgs
             if Settings.shared.greedyEnabled {
                 outdatedArgs.append("--greedy")
             }
-            let output = try await runProcess(brewPath, arguments: outdatedArgs)
-            let parsed = BrewManager.parseOutdatedJSON(output)
+            let output = try await processRunner.run(brewPath, arguments: outdatedArgs)
+            guard state == .checking, !isUpdateInProgress else {
+                return
+            }
+            if BrewParser.outputContainsError(output) {
+                setCheckErrorState(messageFrom: output, updateOutput: updateOutput, outdatedOutput: output)
+                return
+            }
+            let parsed = BrewParser.parseOutdatedJSON(output)
             packages = parsed
             selectedPackages = Set(parsed.map { $0.name })
+            dependencyGraph = await resolveDependencies(for: parsed)
 
-            // Run plain-text outdated for the check log
+            // Run plain-text outdated for the check log.
             var plainArgs = Constants.Process.outdatedPlainArgs
             if Settings.shared.greedyEnabled {
                 plainArgs.append("--greedy")
             }
-            let plainOutput = try await runProcess(brewPath, arguments: plainArgs)
+            let plainOutput = try await processRunner.run(brewPath, arguments: plainArgs)
+            guard state == .checking, !isUpdateInProgress else {
+                return
+            }
+            if BrewParser.outputContainsError(plainOutput) {
+                setCheckErrorState(messageFrom: plainOutput, updateOutput: updateOutput, outdatedOutput: plainOutput)
+                return
+            }
 
-            checkLog = BrewManager.buildCheckLog(updateOutput: updateOutput, outdatedOutput: plainOutput)
+            checkLog = BrewParser.buildCheckLog(updateOutput: updateOutput, outdatedOutput: plainOutput)
+            checkTime = Date()
+            guard state == .checking, !isUpdateInProgress else {
+                return
+            }
             state = parsed.isEmpty ? .upToDate : .updatesAvailable
         } catch {
-            state = .error(error.localizedDescription)
+            // Ignore stale errors from a check superseded by another state.
+            guard state == .checking, !isUpdateInProgress else {
+                return
+            }
+            state = .checkError(error.localizedDescription)
         }
         #endif
     }
 
+    /// Sets a dedicated check error state and captures a useful check log.
+    /// - Parameters:
+    ///   - output: Process output that contains an error marker.
+    ///   - updateOutput: Raw output from `brew update`.
+    ///   - outdatedOutput: Raw output from `brew outdated`.
+    private func setCheckErrorState(messageFrom output: String, updateOutput: String, outdatedOutput: String) {
+        guard state == .checking, !isUpdateInProgress else {
+            return
+        }
+
+        let fallback = output
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "\n")
+            .map(String.init)
+            .first
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let message = BrewParser.firstErrorLine(in: output) ?? fallback ?? L10n.State.checkError
+
+        state = .checkError(message)
+        checkLog = BrewParser.buildCheckLog(updateOutput: updateOutput, outdatedOutput: outdatedOutput)
+        checkTime = Date()
+    }
+
     // MARK: - Update Packages
+
+    /// Builds the correct Homebrew arguments for upgrading or forcing a reinstall.
+    ///
+    /// `brew upgrade --force` is not a reliable repair command for a broken or
+    /// stale installation; the repair path should use `brew reinstall --force`.
+    /// - Parameters:
+    ///   - package: The package to upgrade.
+    ///   - greedy: Whether to include `--greedy` for cask upgrades.
+    ///   - forceUpgrade: Whether the install should be forced with a reinstall.
+    /// - Returns: The normalized argument array for the brew subcommand.
+    static func buildUpgradeArguments(package: BrewPackage, greedy: Bool, forceUpgrade: Bool) -> [String] {
+        let command: String = forceUpgrade ? "reinstall" : "upgrade"
+        var args = [command]
+
+        if !forceUpgrade && greedy {
+            args.append("--greedy")
+        }
+
+        if forceUpgrade {
+            args.append("--force")
+        }
+
+        if package.type == Constants.PackageType.cask {
+            args.append("--cask")
+        }
+
+        args.append(package.name)
+        return args
+    }
 
     /// Upgrades the currently selected packages one by one.
     ///
     /// Sets `state` to `.updating` during the operation.
     /// Populates `updateResults` with per-package status and log output.
-    func updateSelectedPackages() async {
+    func updateSelectedPackages(forceUpgrade: Bool = false) async {
+        // Prevent overlapping update workflows and block background checks for
+        // the full duration (including any preflight work before `.updating`).
+        guard !isUpdateInProgress else { return }
+
         #if DEBUG_MOCK
         let toUpdate = packages.filter { selectedPackages.contains($0.name) }
         guard !toUpdate.isEmpty else { return }
+        isUpdateInProgress = true
+        defer { isUpdateInProgress = false }
+        let orderedToUpdate = DependencyResolver.orderPackagesForUpdate(toUpdate, dependencyGraph: dependencyGraph)
+
+        // Toggle failure mode: odd runs may fail, even runs always succeed
+        mockFailureEnabled.toggle()
+        let failureEnabled = mockFailureEnabled
 
         state = .updating
 
         // Initialize all results as queued
-        updateResults = toUpdate.map { pkg in
+        updateResults = orderedToUpdate.map { pkg in
             PackageUpdateResult(package: pkg, status: .queued, log: "")
         }
 
@@ -143,20 +294,51 @@ final class BrewManager: ObservableObject {
                 }
             }
 
+            // Randomly determine if this package upgrade fails (~10% chance, only when failure mode is active)
+            let shouldFail = failureEnabled && Double.random(in: 0..<1) < 0.1
+
             // Simulate streaming upgrade output
             let lines: [String]
-            if updateResults[i].package.name == Constants.MockData.failedPackageName {
+            if shouldFail {
                 lines = [
                     "==> Upgrading \(updateResults[i].package.name)\n",
                     "==> Downloading...\n",
+                    "######################################################################### 100.0%\n",
+                    "==> Extracting \(updateResults[i].package.name) from archive\n",
+                    "==> Running post-install procedures\n",
+                    "==> Verifying package integrity\n",
+                    "==> Building and installing \(updateResults[i].package.name)...\n",
+                    "🔨 Building \(updateResults[i].package.name) with dependencies...\n",
+                    "⏳ Compilation stage 1 of 5: Preprocessing\n",
+                    "⏳ Compilation stage 2 of 5: Configuration check\n",
+                    "⏳ Compilation stage 3 of 5: Build\n",
+                    "⏳ Compilation stage 4 of 5: Testing build artifacts\n",
+                    "❌ Error during testing phase\n",
                     "Error: Mock upgrade failure for \(updateResults[i].package.name)\n",
+                    "Build failed at stage 4 of 5\n",
+                    "See log file: /var/log/\(updateResults[i].package.name).log\n",
                 ]
             } else {
                 lines = [
                     "==> Upgrading \(updateResults[i].package.name)\n",
                     "==> Downloading...\n",
+                    "######################################################################### 100.0%\n",
+                    "==> Extracting \(updateResults[i].package.name) from archive\n",
+                    "==> Running post-install procedures\n",
+                    "==> Verifying package integrity\n",
+                    "==> Building and installing \(updateResults[i].package.name)...\n",
+                    "🔨 Building \(updateResults[i].package.name) with dependencies...\n",
+                    "⏳ Compilation stage 1 of 5: Preprocessing\n",
+                    "⏳ Compilation stage 2 of 5: Configuration check\n",
+                    "⏳ Compilation stage 3 of 5: Build\n",
+                    "⏳ Compilation stage 4 of 5: Testing build artifacts\n",
+                    "✅ All tests passed\n",
+                    "⏳ Compilation stage 5 of 5: Installation\n",
                     "==> Installing \(updateResults[i].package.name)\n",
-                    "🍺  \(updateResults[i].package.availableVersion)\n",
+                    "🍺  \(updateResults[i].package.name) \(updateResults[i].package.availableVersion) has been successfully installed\n",
+                    "==> Cleanup\n",
+                    "==> Removing old files\n",
+                    "✅ Installation complete\n",
                 ]
             }
 
@@ -165,14 +347,10 @@ final class BrewManager: ObservableObject {
                 updateResults[i].log += line
             }
 
-            // Simulate one failure for demonstration
-            if updateResults[i].package.name == Constants.MockData.failedPackageName {
-                updateResults[i].status = .failed
-            } else {
-                updateResults[i].status = .success
-            }
+            updateResults[i].status = shouldFail ? .failed : .success
         }
 
+        pruneSuccessfullyUpdatedPackagesFromCache()
         state = .updateComplete(hasErrors: updateResults.contains { $0.status == .failed })
         return
         #else
@@ -183,6 +361,11 @@ final class BrewManager: ObservableObject {
 
         let toUpdate = packages.filter { selectedPackages.contains($0.name) }
         guard !toUpdate.isEmpty else { return }
+        isUpdateInProgress = true
+        defer { isUpdateInProgress = false }
+        let orderedToUpdate = DependencyResolver.orderPackagesForUpdate(toUpdate, dependencyGraph: dependencyGraph)
+
+        state = .updating
 
         if Settings.shared.savedPasswordEnabled {
             let preflight = BrewManager.preflightSavedPassword()
@@ -191,7 +374,7 @@ final class BrewManager: ObservableObject {
                 break
             case .incorrect(let details):
                 state = .error(L10n.Error.savedPasswordInvalid)
-                updateResults = toUpdate.map { pkg in
+                updateResults = orderedToUpdate.map { pkg in
                     PackageUpdateResult(
                         package: pkg,
                         status: .failed,
@@ -201,7 +384,7 @@ final class BrewManager: ObservableObject {
                 return
             case .unavailable(let reason):
                 state = .error(L10n.Error.savedPasswordUnavailable)
-                updateResults = toUpdate.map { pkg in
+                updateResults = orderedToUpdate.map { pkg in
                     PackageUpdateResult(
                         package: pkg,
                         status: .failed,
@@ -212,10 +395,8 @@ final class BrewManager: ObservableObject {
             }
         }
 
-        state = .updating
-
-        // Initialize all results as queued
-        updateResults = toUpdate.map { pkg in
+        // Initialize all results as queued.
+        updateResults = orderedToUpdate.map { pkg in
             PackageUpdateResult(package: pkg, status: .queued, log: "")
         }
 
@@ -228,18 +409,18 @@ final class BrewManager: ObservableObject {
         for i in updateResults.indices {
             updateResults[i].status = .updating
 
-            var args = Constants.Process.upgradeArgs
-            if greedy {
-                args.append("--greedy")
-            }
-            args.append(updateResults[i].package.name)
+            let args = BrewManager.buildUpgradeArguments(
+                package: updateResults[i].package,
+                greedy: greedy,
+                forceUpgrade: forceUpgrade
+            )
 
             do {
-                try await runProcessStreaming(brewPath, arguments: args, environment: upgradeEnv) { [weak self] chunk in
+                try await processRunner.runStreaming(brewPath, arguments: args, environment: upgradeEnv) { [weak self] chunk in
                     self?.updateResults[i].log += chunk
                 }
-                // Check output for error patterns (brew may exit 0 even on failure)
-                if BrewManager.outputContainsError(updateResults[i].log) {
+                // Check output for error patterns (brew may exit 0 even on failure).
+                if BrewParser.outputContainsError(updateResults[i].log) {
                     updateResults[i].status = .failed
                 } else {
                     updateResults[i].status = .success
@@ -250,9 +431,61 @@ final class BrewManager: ObservableObject {
             }
         }
 
-        // Set state to update complete (user can press "Check Now" to re-check)
+        pruneSuccessfullyUpdatedPackagesFromCache()
+        // Set state to update complete (user can press "Check Now" to re-check).
         state = .updateComplete(hasErrors: updateResults.contains { $0.status == .failed })
         #endif
+    }
+
+    /// Removes successfully updated packages from the cached outdated-package
+    /// data so post-update UI and icon state reflect what still remains.
+    private func pruneSuccessfullyUpdatedPackagesFromCache() {
+        let successfulNames = Set(updateResults.compactMap { result in
+            result.status == .success ? result.package.name : nil
+        })
+        guard !successfulNames.isEmpty else { return }
+
+        packages = packages.filter { !successfulNames.contains($0.name) }
+        let available = Set(packages.map { $0.name })
+        dependencyGraph = dependencyGraph
+            .filter { available.contains($0.key) }
+            .mapValues { deps in deps.filter { available.contains($0) } }
+        selectedPackages = selectedPackages.intersection(available)
+    }
+
+    /// Selected packages sorted so dependencies are updated before dependents.
+    var selectedPackagesInDependencyOrder: [BrewPackage] {
+        let selected = packages.filter { selectedPackages.contains($0.name) }
+        return DependencyResolver.orderPackagesForUpdate(selected, dependencyGraph: dependencyGraph)
+    }
+
+    /// Selected package names that are part of a dependency cycle.
+    var selectedDependencyCycleNodes: [String] {
+        let selected = packages.filter { selectedPackages.contains($0.name) }
+        return DependencyResolver.dependencyCycleNodes(packages: selected, dependencyGraph: dependencyGraph)
+    }
+
+    /// Whether the package list can be switched back to remaining outdated items
+    /// using cached data from the most recent update run.
+    var canShowRemainingPackagesAfterUpdate: Bool {
+        guard state.isUpdateComplete else { return false }
+        let successfulNames = Set(updateResults.compactMap { result in
+            result.status == .success ? result.package.name : nil
+        })
+        return packages.contains { !successfulNames.contains($0.name) }
+    }
+
+    /// Switches UI state from update results back to the remaining outdated
+    /// package list without running `brew update`/`brew outdated` again.
+    ///
+    /// This is a best-effort local refresh based on the previous check and
+    /// per-package update outcomes of the latest update run.
+    func showRemainingPackagesAfterUpdate() {
+        guard state.isUpdateComplete else { return }
+
+        pruneSuccessfullyUpdatedPackagesFromCache()
+
+        state = packages.isEmpty ? .upToDate : .updatesAvailable
     }
 
     // MARK: - Selection Helpers
@@ -286,9 +519,11 @@ final class BrewManager: ObservableObject {
     func setAllSelected(_ selected: Bool, forType type: String) {
         let typePackages = packages.filter { $0.type == type }
         if selected {
-            typePackages.forEach { selectedPackages.insert($0.name) }
+            let combined = selectedPackages.union(typePackages.map { $0.name })
+            selectedPackages = selectedNamesIncludingDependencies(from: combined)
         } else {
-            typePackages.forEach { selectedPackages.remove($0.name) }
+            let names = Set(typePackages.map { $0.name })
+            selectedPackages = selectedNamesAfterDeselection(of: names)
         }
     }
 
@@ -296,44 +531,69 @@ final class BrewManager: ObservableObject {
     /// - Parameter name: The package name to toggle.
     func toggleSelection(_ name: String) {
         if selectedPackages.contains(name) {
-            selectedPackages.remove(name)
+            selectedPackages = selectedNamesAfterDeselection(of: [name])
         } else {
-            selectedPackages.insert(name)
+            let combined = selectedPackages.union([name])
+            selectedPackages = selectedNamesIncludingDependencies(from: combined)
         }
     }
 
-    // MARK: - Private Helpers
-
-    /// Builds the check log from raw `brew update` and `brew outdated` output.
-    /// - Parameters:
-    ///   - updateOutput: Raw output from `brew update`.
-    ///   - outdatedOutput: Raw output from `brew outdated` (plain text).
-    /// - Returns: A combined log string.
-    nonisolated static func buildCheckLog(updateOutput: String = "", outdatedOutput: String = "") -> String {
-        var sections: [String] = []
-
-        let trimmedUpdate = updateOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedUpdate.isEmpty {
-            sections.append(trimmedUpdate)
-        }
-
-        let trimmedOutdated = outdatedOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedOutdated.isEmpty {
-            sections.append(trimmedOutdated)
-        }
-
-        return sections.joined(separator: "\n\n")
+    /// Expands selected names to include all transitive dependencies that are
+    /// currently part of the outdated package list.
+    private func selectedNamesIncludingDependencies(from names: Set<String>) -> Set<String> {
+        let expanded = DependencyResolver.expandedSelectionIncludingDependencies(
+            selectedNames: names,
+            dependencyGraph: dependencyGraph
+        )
+        let available = Set(packages.map { $0.name })
+        return expanded.intersection(available)
     }
 
-    /// Checks whether process output contains error patterns from brew.
+    /// Removes deselected names and all selected packages that depend on them.
+    private func selectedNamesAfterDeselection(of names: Set<String>) -> Set<String> {
+        let updated = DependencyResolver.selectionAfterDeselectionRemovingDependents(
+            selectedNames: selectedPackages,
+            deselectedNames: names,
+            dependencyGraph: dependencyGraph
+        )
+        let available = Set(packages.map { $0.name })
+        return updated.intersection(available)
+    }
+
+    // MARK: - Dependency Resolution
+
+    /// Resolves dependencies for the provided outdated packages using `brew deps`.
     ///
-    /// Homebrew sometimes exits with code 0 even when individual package
-    /// upgrades fail. This method scans the output for known error markers.
-    /// - Parameter output: The process output string.
-    /// - Returns: `true` if the output contains error indicators.
-    nonisolated static func outputContainsError(_ output: String) -> Bool {
-        output.contains("Error:") || output.contains("sudo: a password is required")
+    /// Only dependencies that are also present in `packages` are retained.
+    private func resolveDependencies(for packages: [BrewPackage]) async -> [String: [String]] {
+        guard let brewPath else { return [:] }
+
+        let packageNames = Set(packages.map { $0.name })
+        var graph: [String: [String]] = [:]
+
+        for pkg in packages {
+            var args = ["deps", "--1"]
+            if pkg.type == Constants.PackageType.cask {
+                args.append("--cask")
+            }
+            args.append(pkg.name)
+
+            do {
+                let output = try await processRunner.run(brewPath, arguments: args)
+                let deps = output
+                    .split(separator: "\n")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty && packageNames.contains($0) }
+                graph[pkg.name] = deps
+            } catch {
+                graph[pkg.name] = []
+            }
+        }
+
+        return graph
     }
+
+    // MARK: - Upgrade Environment
 
     /// Creates an environment dictionary for `brew upgrade` with `SUDO_ASKPASS` set.
     ///
@@ -397,6 +657,8 @@ final class BrewManager: ObservableObject {
         ]
     }
 
+    // MARK: - Password Preflight
+
     /// Validates the saved sudo password before starting an update batch.
     ///
     /// Uses the same Keychain-backed askpass helper as `brew upgrade` and
@@ -453,6 +715,8 @@ final class BrewManager: ObservableObject {
         let details = cleaned.isEmpty ? "exit \(exit)" : "\(cleaned) (exit \(exit))"
         return .incorrect(details: details)
     }
+
+    // MARK: - Mock Helpers
 
     #if DEBUG_MOCK
     /// (Mock only) Runs the askpass helper script and returns a redacted
@@ -521,171 +785,4 @@ final class BrewManager: ObservableObject {
         )
     }
     #endif
-
-    /// Thread-safe accumulator for process output used during streaming.
-    private final class OutputAccumulator: @unchecked Sendable {
-        private let lock = NSLock()
-        private var buffer = ""
-
-        func append(_ chunk: String) {
-            lock.lock()
-            buffer += chunk
-            lock.unlock()
-        }
-
-        var value: String {
-            lock.lock()
-            defer { lock.unlock() }
-            return buffer
-        }
-    }
-
-    /// Runs a process, streaming output chunks to the caller via `onOutput`.
-    ///
-    /// Each chunk is delivered on the main actor so callers can safely update
-    /// `@Published` properties. The full output is also returned when the
-    /// process completes.
-
-    /// Runs a process and returns its standard output as a string.
-    /// - Parameters:
-    ///   - path: Path to the executable.
-    ///   - arguments: Arguments to pass.
-    /// - Returns: The stdout output.
-    private func runProcess(_ path: String, arguments: [String]) async throws -> String {
-        try await runProcessStreaming(path, arguments: arguments, environment: nil, onOutput: nil)
-    }
-
-    /// Runs a process with streaming output support.
-    /// - Parameters:
-    ///   - path: Path to the executable.
-    ///   - arguments: Arguments to pass.
-    ///   - environment: Optional custom environment variables. Merged with current process env.
-    ///   - onOutput: Optional callback invoked with each chunk of output as it arrives.
-    /// - Returns: The complete stdout/stderr output.
-    @discardableResult
-    private func runProcessStreaming(
-        _ path: String,
-        arguments: [String],
-        environment: [String: String]?,
-        onOutput: (@Sendable @MainActor (String) -> Void)?
-    ) async throws -> String {
-        let executableURL = URL(fileURLWithPath: path)
-        var mergedEnv = ProcessInfo.processInfo.environment
-        if let environment {
-            mergedEnv.merge(environment) { _, new in new }
-        }
-        let env = mergedEnv
-
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Foundation.Process()
-                let pipe = Pipe()
-
-                process.executableURL = executableURL
-                process.arguments = arguments
-                process.standardOutput = pipe
-                process.standardError = pipe
-                process.environment = env
-
-                let accumulator = OutputAccumulator()
-
-                // Stream chunks if callback provided
-                if let onOutput {
-                    pipe.fileHandleForReading.readabilityHandler = { handle in
-                        let data = handle.availableData
-                        guard !data.isEmpty else { return }
-                        if let chunk = String(data: data, encoding: .utf8) {
-                            accumulator.append(chunk)
-                            DispatchQueue.main.async {
-                                onOutput(chunk)
-                            }
-                        }
-                    }
-                }
-
-                do {
-                    try process.run()
-                } catch {
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                if let onOutput {
-                    // Wait for process to finish, then clean up handler
-                    process.waitUntilExit()
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    // Read any remaining data
-                    let remaining = pipe.fileHandleForReading.readDataToEndOfFile()
-                    if let chunk = String(data: remaining, encoding: .utf8), !chunk.isEmpty {
-                        accumulator.append(chunk)
-                        DispatchQueue.main.async {
-                            onOutput(chunk)
-                        }
-                    }
-                    continuation.resume(returning: accumulator.value)
-                } else {
-                    // Non-streaming: read all at once (avoids pipe buffer deadlock)
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    process.waitUntilExit()
-                    let output = String(data: data, encoding: .utf8) ?? ""
-                    continuation.resume(returning: output)
-                }
-            }
-        }
-    }
-
-    /// Parses the JSON output of `brew outdated --json=v2`.
-    /// - Parameter json: The raw JSON string.
-    /// - Returns: An array of `BrewPackage` with update info.
-    nonisolated static func parseOutdatedJSON(_ json: String) -> [BrewPackage] {
-        guard let data = json.data(using: .utf8) else { return [] }
-
-        struct OutdatedResponse: Decodable {
-            struct Formula: Decodable {
-                let name: String
-                let installed_versions: [String]
-                let current_version: String
-            }
-            struct Cask: Decodable {
-                let name: String
-                let installed_versions: [String]
-                let current_version: String
-            }
-            let formulae: [Formula]?
-            let casks: [Cask]?
-        }
-
-        do {
-            let response = try JSONDecoder().decode(OutdatedResponse.self, from: data)
-            var result: [BrewPackage] = []
-
-            if let formulae = response.formulae {
-                for f in formulae {
-                    result.append(BrewPackage(
-                        type: Constants.PackageType.formula,
-                        name: f.name,
-                        installedVersion: f.installed_versions.last ?? "?",
-                        availableVersion: f.current_version
-                    ))
-                }
-            }
-
-            if let casks = response.casks {
-                for c in casks {
-                    result.append(BrewPackage(
-                        type: Constants.PackageType.cask,
-                        name: c.name,
-                        installedVersion: c.installed_versions.last ?? "?",
-                        availableVersion: c.current_version
-                    ))
-                }
-            }
-
-            return result
-        } catch {
-            NSLog("Failed to parse brew outdated JSON: \(error)")
-            return []
-        }
-    }
 }

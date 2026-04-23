@@ -1,4 +1,4 @@
-# Agent Instructions for Homebrew Update Notifier
+# Agent Instructions for Koebes
 
 ## Build/Test/Lint Commands
 
@@ -28,7 +28,7 @@ Available test suites: Constants, Localization, UpdateState, Settings, BrewManag
 ```bash
 make all
 ```
-(Builds the app bundle to `.build/Homebrew Update Notifier.app`)
+(Builds the app bundle to `.build/Koebes.app`)
 
 **Clean build artifacts:**
 ```bash

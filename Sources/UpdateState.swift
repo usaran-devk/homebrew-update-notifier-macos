@@ -6,17 +6,30 @@ import SwiftUI
 enum UpdateState: Equatable, Sendable {
     case unknown
     case checking
+    case checkError(String)
     case upToDate
     case updatesAvailable
     case updating
     case updateComplete(hasErrors: Bool)
     case error(String)
 
+    /// The SF Symbol name for the menu bar base icon.
+    var baseSymbolName: String {
+        switch self {
+        case .updatesAvailable:
+            return Constants.Symbols.baseUpdatesAvailable
+        default:
+            return Constants.Symbols.base
+        }
+    }
+
     /// The SF Symbol name for the state badge overlay.
     var badgeSymbolName: String {
         switch self {
         case .unknown, .checking:
             return Constants.Symbols.badgeChecking
+        case .checkError:
+            return Constants.Symbols.badgeError
         case .upToDate:
             return Constants.Symbols.badgeUpToDate
         case .updatesAvailable:
@@ -37,6 +50,8 @@ enum UpdateState: Equatable, Sendable {
             return L10n.State.unknown
         case .checking:
             return L10n.State.checking
+        case .checkError:
+            return L10n.State.checkError
         case .upToDate:
             return L10n.State.upToDate
         case .updatesAvailable:
@@ -52,6 +67,7 @@ enum UpdateState: Equatable, Sendable {
 
     /// Whether the state represents an error.
     var isError: Bool {
+        if case .checkError = self { return true }
         if case .error = self { return true }
         return false
     }
@@ -69,6 +85,8 @@ enum UpdateState: Equatable, Sendable {
             return .systemGreen
         case .updatesAvailable:
             return .systemOrange
+        case .checkError:
+            return .systemRed
         case .error:
             return .systemRed
         case .checking, .updating:

@@ -4,18 +4,20 @@ import Foundation
 
 /// Simple test framework mimicking describe/it pattern.
 
-/// Test runner runs single-threaded so these are safe.
+/// Test runner runs single-threaded on the main actor so these are safe.
 nonisolated(unsafe) private var totalTests = 0
 nonisolated(unsafe) private var passedTests = 0
 nonisolated(unsafe) private var failedTests = 0
 nonisolated(unsafe) private var currentDescribe = ""
 
+@MainActor
 func describe(_ name: String, _ block: () -> Void) {
     currentDescribe = name
     print("  \(name)")
     block()
 }
 
+@MainActor
 func it(_ name: String, _ block: () throws -> Void) {
     totalTests += 1
     do {
@@ -64,6 +66,7 @@ func expectNotNil<T>(_ value: T?, file: String = #file, line: Int = #line) throw
 
 // MARK: - Test Runner
 
+@MainActor
 enum TestRunner {
     static func main() {
         print("Running tests...\n")
@@ -84,6 +87,7 @@ enum TestRunner {
 
 // MARK: - Constants Tests
 
+@MainActor
 func testConstants() {
     describe("Constants.Executables") {
         it("has ARM brew path") {
@@ -120,7 +124,7 @@ func testConstants() {
 
     describe("Constants.Keychain") {
         it("has a stable service name") {
-            try expect(Constants.Keychain.serviceName, "de.devk.homebrew-update-notifier.sudo")
+            try expect(Constants.Keychain.serviceName, "de.devk.koebes.sudo")
         }
     }
 
@@ -133,6 +137,9 @@ func testConstants() {
     describe("Constants.Symbols") {
         it("has base symbol") {
             try expect(Constants.Symbols.base, "mug.fill")
+        }
+        it("has baseUpdatesAvailable symbol") {
+            try expect(Constants.Symbols.baseUpdatesAvailable, "mug")
         }
         it("has badgeUpToDate symbol") {
             try expect(Constants.Symbols.badgeUpToDate, "checkmark.circle.fill")
@@ -154,6 +161,7 @@ func testConstants() {
 
 // MARK: - Localization Tests
 
+@MainActor
 func testLocalization() {
     describe("Localization.State") {
         it("upToDate is not empty") {
@@ -164,6 +172,9 @@ func testLocalization() {
         }
         it("checking is not empty") {
             try expectFalse(L10n.State.checking.isEmpty)
+        }
+        it("checkError is not empty") {
+            try expectFalse(L10n.State.checkError.isEmpty)
         }
         it("updating is not empty") {
             try expectFalse(L10n.State.updating.isEmpty)
@@ -182,6 +193,27 @@ func testLocalization() {
     describe("Localization.Menu") {
         it("selectAll is not empty") {
             try expectFalse(L10n.Menu.selectAll.isEmpty)
+        }
+        it("updateSelectedWithForce is not empty") {
+            try expectFalse(L10n.Menu.updateSelectedWithForce.isEmpty)
+        }
+        it("updateModePromptTitle is not empty") {
+            try expectFalse(L10n.Menu.updateModePromptTitle.isEmpty)
+        }
+        it("updateModePromptMessage is not empty") {
+            try expectFalse(L10n.Menu.updateModePromptMessage.isEmpty)
+        }
+        it("showRemaining is not empty") {
+            try expectFalse(L10n.Menu.showRemaining.isEmpty)
+        }
+        it("dependencyTree is not empty") {
+            try expectFalse(L10n.Menu.dependencyTree.isEmpty)
+        }
+        it("dependencyTreeForType is not empty") {
+            try expectFalse(L10n.Menu.dependencyTreeForType("Formulae").isEmpty)
+        }
+        it("dependencyCycleWarning is not empty") {
+            try expectFalse(L10n.Menu.dependencyCycleWarning("a, b").isEmpty)
         }
         it("quit is not empty") {
             try expectFalse(L10n.Menu.quit.isEmpty)
@@ -212,13 +244,26 @@ func testLocalization() {
 
 // MARK: - UpdateState Tests
 
+@MainActor
 func testUpdateState() {
     describe("UpdateState") {
+        it("unknown uses filled mug base icon") {
+            try expect(UpdateState.unknown.baseSymbolName, Constants.Symbols.base)
+        }
+        it("updatesAvailable uses empty mug base icon") {
+            try expect(UpdateState.updatesAvailable.baseSymbolName, Constants.Symbols.baseUpdatesAvailable)
+        }
+        it("upToDate uses filled mug base icon") {
+            try expect(UpdateState.upToDate.baseSymbolName, Constants.Symbols.base)
+        }
         it("unknown uses checking badge") {
             try expect(UpdateState.unknown.badgeSymbolName, Constants.Symbols.badgeChecking)
         }
         it("checking uses checking badge") {
             try expect(UpdateState.checking.badgeSymbolName, Constants.Symbols.badgeChecking)
+        }
+        it("checkError uses error badge") {
+            try expect(UpdateState.checkError("test").badgeSymbolName, Constants.Symbols.badgeError)
         }
         it("upToDate uses upToDate badge") {
             try expect(UpdateState.upToDate.badgeSymbolName, Constants.Symbols.badgeUpToDate)
@@ -253,6 +298,9 @@ func testUpdateState() {
         it("error uses error badge") {
             try expect(UpdateState.error("test").badgeSymbolName, Constants.Symbols.badgeError)
         }
+        it("isError returns true for checkError state") {
+            try expectTrue(UpdateState.checkError("test").isError)
+        }
         it("isError returns true for error state") {
             try expectTrue(UpdateState.error("test").isError)
         }
@@ -280,6 +328,7 @@ func testUpdateState() {
 
 // MARK: - Settings Tests
 
+@MainActor
 func testSettings() {
     describe("Settings") {
         it("checkIntervalSeconds converts correctly") {
@@ -348,10 +397,11 @@ func testSettings() {
 
 // MARK: - BrewManager Parsing Tests
 
+@MainActor
 func testBrewManagerParsing() {
-    describe("BrewManager.parseOutdatedJSON") {
+    describe("BrewParser.parseOutdatedJSON") {
         it("parses empty JSON") {
-            let result = BrewManager.parseOutdatedJSON("{}")
+            let result = BrewParser.parseOutdatedJSON("{}")
             try expect(result.count, 0)
         }
 
@@ -368,7 +418,7 @@ func testBrewManagerParsing() {
                 "casks": []
             }
             """
-            let result = BrewManager.parseOutdatedJSON(json)
+            let result = BrewParser.parseOutdatedJSON(json)
             try expect(result.count, 1)
             try expect(result[0].name, "wget")
             try expect(result[0].installedVersion, "1.21")
@@ -389,7 +439,7 @@ func testBrewManagerParsing() {
                 ]
             }
             """
-            let result = BrewManager.parseOutdatedJSON(json)
+            let result = BrewParser.parseOutdatedJSON(json)
             try expect(result.count, 1)
             try expect(result[0].name, "firefox")
             try expect(result[0].installedVersion, "120.0")
@@ -416,60 +466,291 @@ func testBrewManagerParsing() {
                 ]
             }
             """
-            let result = BrewManager.parseOutdatedJSON(json)
+            let result = BrewParser.parseOutdatedJSON(json)
             try expect(result.count, 2)
         }
 
         it("returns empty for invalid JSON") {
-            let result = BrewManager.parseOutdatedJSON("not json")
+            let result = BrewParser.parseOutdatedJSON("not json")
             try expect(result.count, 0)
         }
     }
 
-    describe("BrewManager.buildCheckLog") {
+    describe("BrewManager.buildUpgradeArguments") {
+        it("uses reinstall with force for forced installs") {
+            let pkg = BrewPackage(type: Constants.PackageType.formula, name: "wget", installedVersion: "1.21", availableVersion: "1.24")
+            let args = BrewManager.buildUpgradeArguments(package: pkg, greedy: true, forceUpgrade: true)
+            try expect(args[0], "reinstall")
+            try expectTrue(args.contains("--force"))
+            try expectFalse(args.contains("--greedy"))
+            try expect(args.last, "wget")
+        }
+    }
+
+    describe("BrewParser.buildCheckLog") {
         it("returns empty string when both outputs are empty") {
-            let log = BrewManager.buildCheckLog()
+            let log = BrewParser.buildCheckLog()
             try expect(log, "")
         }
 
         it("includes brew update output") {
-            let log = BrewManager.buildCheckLog(updateOutput: "Updated 1 tap.")
+            let log = BrewParser.buildCheckLog(updateOutput: "Updated 1 tap.")
             try expect(log, "Updated 1 tap.")
         }
 
         it("includes brew outdated output") {
-            let log = BrewManager.buildCheckLog(outdatedOutput: "wget (1.0) < 2.0")
+            let log = BrewParser.buildCheckLog(outdatedOutput: "wget (1.0) < 2.0")
             try expect(log, "wget (1.0) < 2.0")
         }
 
         it("combines both outputs with blank line separator") {
-            let log = BrewManager.buildCheckLog(updateOutput: "Updated 1 tap.", outdatedOutput: "wget (1.0) < 2.0")
+            let log = BrewParser.buildCheckLog(updateOutput: "Updated 1 tap.", outdatedOutput: "wget (1.0) < 2.0")
             try expectTrue(log.contains("Updated 1 tap."))
             try expectTrue(log.contains("wget (1.0) < 2.0"))
             try expectTrue(log.contains("\n\n"))
         }
 
         it("trims whitespace from outputs") {
-            let log = BrewManager.buildCheckLog(updateOutput: "  \n  ", outdatedOutput: "  \n  ")
+            let log = BrewParser.buildCheckLog(updateOutput: "  \n  ", outdatedOutput: "  \n  ")
             try expect(log, "")
         }
     }
 
-    describe("BrewManager.outputContainsError") {
+    describe("BrewParser.outputContainsError") {
         it("detects Error: pattern") {
-            try expectTrue(BrewManager.outputContainsError("Error: docker-desktop: Failure while executing"))
+            try expectTrue(BrewParser.outputContainsError("Error: docker-desktop: Failure while executing"))
         }
 
         it("detects sudo password required") {
-            try expectTrue(BrewManager.outputContainsError("sudo: a password is required"))
+            try expectTrue(BrewParser.outputContainsError("sudo: a password is required"))
         }
 
         it("returns false for clean output") {
-            try expectFalse(BrewManager.outputContainsError("==> Upgrading wget\n🍺  1.24.5"))
+            try expectFalse(BrewParser.outputContainsError("==> Upgrading wget\n🍺  1.24.5"))
         }
 
         it("returns false for empty output") {
-            try expectFalse(BrewManager.outputContainsError(""))
+            try expectFalse(BrewParser.outputContainsError(""))
+        }
+    }
+
+    describe("BrewParser.firstErrorLine") {
+        it("extracts first Error line") {
+            let output = "==> Updating Homebrew\nError: failed to fetch\nDetails..."
+            try expect(BrewParser.firstErrorLine(in: output), "Error: failed to fetch")
+        }
+
+        it("extracts sudo password required line") {
+            let output = "prefix\nsudo: a password is required\nmore"
+            try expect(BrewParser.firstErrorLine(in: output), "sudo: a password is required")
+        }
+
+        it("returns nil when output has no known error markers") {
+            try expectNil(BrewParser.firstErrorLine(in: "==> Updated 1 tap."))
+        }
+    }
+
+    describe("DependencyResolver.orderPackagesForUpdate") {
+        it("orders dependencies before dependents") {
+            let python = BrewPackage(type: Constants.PackageType.formula, name: "python@3.12", installedVersion: "3.12.2", availableVersion: "3.12.4")
+            let node = BrewPackage(type: Constants.PackageType.formula, name: "node", installedVersion: "20.11.0", availableVersion: "22.2.0")
+            let git = BrewPackage(type: Constants.PackageType.formula, name: "git", installedVersion: "2.43.0", availableVersion: "2.45.1")
+
+            let ordered = DependencyResolver.orderPackagesForUpdate(
+                [node, git, python],
+                dependencyGraph: [
+                    "node": ["python@3.12"],
+                    "git": [],
+                    "python@3.12": [],
+                ]
+            )
+
+            let names = ordered.map(\.name)
+            try expectTrue(names.firstIndex(of: "python@3.12")! < names.firstIndex(of: "node")!)
+        }
+
+        it("keeps deterministic output when cycle exists") {
+            let a = BrewPackage(type: Constants.PackageType.formula, name: "a", installedVersion: "1.0", availableVersion: "1.1")
+            let b = BrewPackage(type: Constants.PackageType.formula, name: "b", installedVersion: "1.0", availableVersion: "1.1")
+
+            let ordered = DependencyResolver.orderPackagesForUpdate(
+                [a, b],
+                dependencyGraph: [
+                    "a": ["b"],
+                    "b": ["a"],
+                ]
+            )
+
+            try expect(ordered.map(\.name), ["b", "a"])
+        }
+    }
+
+    describe("DependencyResolver.dependencyTreeLines") {
+        it("renders an ASCII tree") {
+            let python = BrewPackage(type: Constants.PackageType.formula, name: "python@3.12", installedVersion: "3.12.2", availableVersion: "3.12.4")
+            let node = BrewPackage(type: Constants.PackageType.formula, name: "node", installedVersion: "20.11.0", availableVersion: "22.2.0")
+
+            let lines = DependencyResolver.dependencyTreeLines(
+                orderedPackages: [python, node],
+                dependencyGraph: [
+                    "node": ["python@3.12"],
+                    "python@3.12": [],
+                ]
+            )
+
+            try expect(lines, ["node", "`- python@3.12"])
+        }
+    }
+
+    describe("DependencyResolver.dependencyCycleNodes") {
+        it("returns nodes in a detected cycle") {
+            let a = BrewPackage(type: Constants.PackageType.formula, name: "a", installedVersion: "1.0", availableVersion: "1.1")
+            let b = BrewPackage(type: Constants.PackageType.formula, name: "b", installedVersion: "1.0", availableVersion: "1.1")
+            let c = BrewPackage(type: Constants.PackageType.formula, name: "c", installedVersion: "1.0", availableVersion: "1.1")
+
+            let nodes = DependencyResolver.dependencyCycleNodes(
+                packages: [a, b, c],
+                dependencyGraph: [
+                    "a": ["b"],
+                    "b": ["a"],
+                    "c": [],
+                ]
+            )
+
+            try expect(nodes, ["a", "b"])
+        }
+
+        it("returns empty when no cycle exists") {
+            let python = BrewPackage(type: Constants.PackageType.formula, name: "python@3.12", installedVersion: "3.12.2", availableVersion: "3.12.4")
+            let node = BrewPackage(type: Constants.PackageType.formula, name: "node", installedVersion: "20.11.0", availableVersion: "22.2.0")
+
+            let nodes = DependencyResolver.dependencyCycleNodes(
+                packages: [python, node],
+                dependencyGraph: [
+                    "node": ["python@3.12"],
+                    "python@3.12": [],
+                ]
+            )
+
+            try expect(nodes.count, 0)
+        }
+    }
+
+    describe("DependencyResolver.expandedSelectionIncludingDependencies") {
+        it("includes transitive dependencies") {
+            let expanded = DependencyResolver.expandedSelectionIncludingDependencies(
+                selectedNames: ["yarn"],
+                dependencyGraph: [
+                    "yarn": ["node"],
+                    "node": ["python@3.12"],
+                    "python@3.12": [],
+                ]
+            )
+
+            try expectTrue(expanded.contains("yarn"))
+            try expectTrue(expanded.contains("node"))
+            try expectTrue(expanded.contains("python@3.12"))
+            try expect(expanded.count, 3)
+        }
+
+        it("handles dependency cycles safely") {
+            let expanded = DependencyResolver.expandedSelectionIncludingDependencies(
+                selectedNames: ["a"],
+                dependencyGraph: [
+                    "a": ["b"],
+                    "b": ["a"],
+                ]
+            )
+
+            try expect(expanded, ["a", "b"])
+        }
+    }
+
+    describe("DependencyResolver.selectionAfterDeselectionRemovingDependents") {
+        it("deselecting a dependency also deselects packages that require it") {
+            let updated = DependencyResolver.selectionAfterDeselectionRemovingDependents(
+                selectedNames: ["yarn", "node", "python@3.12", "wget"],
+                deselectedNames: ["node"],
+                dependencyGraph: [
+                    "yarn": ["node"],
+                    "node": ["python@3.12"],
+                    "python@3.12": [],
+                    "wget": [],
+                ]
+            )
+
+            try expectFalse(updated.contains("node"))
+            try expectFalse(updated.contains("yarn"))
+            try expectTrue(updated.contains("python@3.12"))
+            try expectTrue(updated.contains("wget"))
+            try expect(updated.count, 2)
+        }
+
+        it("does not auto-prune dependencies when a dependent is deselected") {
+            let updated = DependencyResolver.selectionAfterDeselectionRemovingDependents(
+                selectedNames: ["yarn", "node", "python@3.12"],
+                deselectedNames: ["yarn"],
+                dependencyGraph: [
+                    "yarn": ["node"],
+                    "node": ["python@3.12"],
+                    "python@3.12": [],
+                ]
+            )
+
+            try expectFalse(updated.contains("yarn"))
+            try expectTrue(updated.contains("node"))
+            try expectTrue(updated.contains("python@3.12"))
+            try expect(updated.count, 2)
+        }
+
+        it("handles cycles while deselecting dependents") {
+            let updated = DependencyResolver.selectionAfterDeselectionRemovingDependents(
+                selectedNames: ["a", "b"],
+                deselectedNames: ["b"],
+                dependencyGraph: [
+                    "a": ["b"],
+                    "b": ["a"],
+                ]
+            )
+
+            try expect(updated.count, 0)
+        }
+    }
+
+    describe("BrewManager.checkForUpdates") {
+        it("sets checkError when brew is not found") {
+            final class CheckStateBox: @unchecked Sendable {
+                var state: UpdateState?
+                var isDone = false
+            }
+
+            let box = CheckStateBox()
+
+            Task { @MainActor in
+                let manager = BrewManager(brewPath: nil)
+                await manager.checkForUpdates()
+                box.state = manager.state
+                box.isDone = true
+            }
+
+            // Spin the RunLoop so the @MainActor task can execute on the main
+            // thread while we wait. A DispatchSemaphore would deadlock here
+            // because it would block the RunLoop the task depends on.
+            let timeout = Date().addingTimeInterval(5)
+            while !box.isDone && Date() < timeout {
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            }
+
+            guard let observedState = box.state else {
+                throw TestFailure(message: "Timed out waiting for checkForUpdates()")
+            }
+
+            switch observedState {
+            case .checkError(let message):
+                try expect(message, L10n.Error.brewNotFound)
+            default:
+                throw TestFailure(message: "Expected checkError when brew path is nil, got \(observedState)")
+            }
         }
     }
 }
@@ -478,6 +759,7 @@ func testBrewManagerParsing() {
 
 @main
 struct TestMain {
+    @MainActor
     static func main() {
         TestRunner.main()
     }

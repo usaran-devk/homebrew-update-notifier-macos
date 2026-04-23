@@ -43,7 +43,11 @@ enum KeychainHelper {
         ]
 
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if updateStatus == errSecSuccess { return }
+        if updateStatus == errSecSuccess {
+            // Re-prime access in case the item was re-saved (ACL may be reset).
+            primeKeychainAccess()
+            return
+        }
 
         if updateStatus == errSecItemNotFound {
             // Add a new item. Use kSecAttrAccessibleWhenUnlocked so the value
@@ -55,6 +59,9 @@ enum KeychainHelper {
             if addStatus != errSecSuccess {
                 throw KeychainError.unhandled(addStatus)
             }
+            // Trigger the "Allow access?" dialog for the `security` CLI now
+            // so the user can grant permanent access before any upgrade runs.
+            primeKeychainAccess()
             return
         }
 
@@ -103,7 +110,52 @@ enum KeychainHelper {
 
     /// Returns `true` if a password is currently stored for the current user.
     static func hasStoredPassword() -> Bool {
-        (try? loadPassword()) != nil
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Constants.Keychain.serviceName,
+            kSecAttrAccount as String: NSUserName(),
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+
+        let status = SecItemCopyMatching(query as CFDictionary, nil)
+        return status == errSecSuccess
+    }
+
+    // MARK: - Access Priming
+
+    /// Triggers the macOS "Allow access?" keychain dialog for the `security`
+    /// CLI tool by performing a read using that same tool immediately after
+    /// the item is saved.
+    ///
+    /// The `security find-generic-password` command used by the askpass helper
+    /// at upgrade time runs as a separate process and is therefore treated by
+    /// macOS as a different accessor than this app. The first time it reads the
+    /// keychain item it shows a permission dialog. By proactively calling this
+    /// method right after saving, the user sees that dialog while still in the
+    /// Settings view — where they can conveniently choose "Always Allow" — so
+    /// the dialog never interrupts an actual upgrade.
+    ///
+    /// The return value of `security` is intentionally ignored; the sole
+    /// purpose of the call is to register `security` as an allowed accessor.
+    @discardableResult
+    static func primeKeychainAccess() -> Bool {
+        let process = Foundation.Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = [
+            "find-generic-password",
+            "-w",
+            "-s", Constants.Keychain.serviceName,
+            "-a", NSUserName(),
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 
     // MARK: - Verification
@@ -181,12 +233,5 @@ enum KeychainHelper {
         let exit = process.terminationStatus
         let details = cleaned.isEmpty ? "exit \(exit)" : "\(cleaned) (exit \(exit))"
         return .incorrect(details: details)
-    }
-
-    // MARK: - Private
-
-    /// Minimal POSIX shell single-quote escaping for embedding paths in scripts.
-    private static func shellQuote(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }

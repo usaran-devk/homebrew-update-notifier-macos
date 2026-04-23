@@ -2,7 +2,12 @@ import Foundation
 import ServiceManagement
 
 /// Manages application settings persisted via UserDefaults.
-final class Settings: @unchecked Sendable {
+///
+/// All properties must be accessed from the main actor. The class is isolated
+/// to `@MainActor` because every call site — `AppDelegate`, `BrewManager`, and
+/// `SettingsView` — already runs on the main actor.
+@MainActor
+final class Settings {
 
     /// Shared singleton instance.
     static let shared = Settings()

@@ -10,56 +10,62 @@ struct MenuBarView: View {
     @ObservedObject var brewManager: BrewManager
     let onSettings: () -> Void
     let onQuit: () -> Void
-    @State private var rotateIcon = false
+    @State private var expandedDependencyTypes: Set<String> = []
+    @State private var showingUpdateModeDialog = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Constants.UI.contentPadding) {
             // App title
-            Text(Constants.appName)
-                .font(.title3)
-                .fontWeight(.bold)
-
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: Constants.Symbols.base)
+                    .font(.title2)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(L10n.appName)
+                        .font(.title2)
+                        .fontWeight(.bold)
+                    Text(L10n.appNameShortDescription)
+                        .font(.title3)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Text("v\(Bundle.main.appVersionString)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
             Divider()
 
             // Status header
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    if brewManager.state == .updating {
+                    if brewManager.state == .updating || brewManager.state == .checking {
                         IndeterminateRing(color: brewManager.state.statusColor, size: 14, lineWidth: 2)
                     } else {
                         Image(systemName: brewManager.state.badgeSymbolName)
                             .foregroundColor(brewManager.state.statusColor)
-                            // Rotate while checking
-                            .rotationEffect(.degrees(rotateIcon ? 360 : 0))
-                            .animation(rotateIcon ? Animation.linear(duration: 1.0).repeatForever(autoreverses: false) : .default, value: rotateIcon)
                     }
                     Text(brewManager.state.statusText)
                         .font(.headline)
                     Spacer()
                 }
-                if case .error(let message) = brewManager.state {
+                if case .checkError(let message) = brewManager.state {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                } else if case .error(let message) = brewManager.state {
                     Text(message)
                         .font(.caption)
                         .foregroundColor(.red)
                 }
             }
-            .onAppear {
-                rotateIcon = (brewManager.state == .checking)
-            }
-            .onChange(of: brewManager.state) { old, new in
-                let should = (new == .checking)
-                // Start/stop rotation
-                rotateIcon = should
-            }
             .padding(.bottom, 4)
 
             // Collapsible check log (shown after a manual or automatic check)
             if !brewManager.checkLog.isEmpty && brewManager.state != .checking && brewManager.state != .updating {
-                CheckLogRow(log: brewManager.checkLog)
+                CheckLogRow(log: brewManager.checkLog, lastChecked: brewManager.checkTime)
             }
 
             Divider()
-
+            
             // Update results (shown during/after update)
             if !brewManager.updateResults.isEmpty && (brewManager.state == .updating || brewManager.state.isUpdateComplete) {
                 updateResultsView
@@ -68,7 +74,7 @@ struct MenuBarView: View {
             else if brewManager.packages.isEmpty && brewManager.state == .upToDate {
                 Text(L10n.Menu.noUpdates)
                     .foregroundColor(.secondary)
-            } else if !brewManager.packages.isEmpty {
+            } else if !brewManager.packages.isEmpty && brewManager.state == .updatesAvailable {
                 packageSelectionView
             }
 
@@ -76,6 +82,13 @@ struct MenuBarView: View {
 
             // Bottom controls
             HStack {
+                if brewManager.canShowRemainingPackagesAfterUpdate {
+                    Button(L10n.Menu.showRemaining) {
+                        brewManager.showRemainingPackagesAfterUpdate()
+                    }
+                    .disabled(brewManager.state == .checking || brewManager.state == .updating)
+                }
+
                 Button(L10n.Menu.checkNow) {
                     Task { await brewManager.checkForUpdates() }
                 }
@@ -93,7 +106,21 @@ struct MenuBarView: View {
             }
         }
         .padding(Constants.UI.contentPadding)
-        .frame(width: Constants.UI.popoverWidth)
+        .confirmationDialog(
+            L10n.Menu.updateModePromptTitle,
+            isPresented: $showingUpdateModeDialog,
+            titleVisibility: .visible
+        ) {
+            Button(L10n.Menu.updateSelected) {
+                Task { await brewManager.updateSelectedPackages(forceUpgrade: false) }
+            }
+            Button(L10n.Menu.updateSelectedWithForce) {
+                Task { await brewManager.updateSelectedPackages(forceUpgrade: true) }
+            }
+            Button(L10n.Settings.cancel, role: .cancel) {}
+        } message: {
+            Text(L10n.Menu.updateModePromptMessage)
+        }
     }
 
     // MARK: - Package Selection View
@@ -114,10 +141,95 @@ struct MenuBarView: View {
         }
     }
 
+    /// Selected package dependency trees grouped by package type.
+    private var selectedDependencyTreeSections: [(type: String, roots: [DependencyTreeNode])] {
+        var result: [(type: String, roots: [DependencyTreeNode])] = []
+        for type in packageTypes {
+            let typePackages = brewManager.packages.filter {
+                $0.type == type && brewManager.selectedPackages.contains($0.name)
+            }
+            if typePackages.isEmpty {
+                continue
+            }
+            let roots = buildDependencyTreeNodes(for: typePackages)
+            if !roots.isEmpty {
+                result.append((type, roots))
+            }
+        }
+
+        return result
+    }
+
+    /// Selected package names that participate in dependency cycles.
+    private var selectedDependencyCycleNodes: [String] {
+        brewManager.selectedDependencyCycleNodes
+    }
+
+    /// Builds a dependency tree for the given selected packages.
+    private func buildDependencyTreeNodes(for packages: [BrewPackage]) -> [DependencyTreeNode] {
+        let orderedNames = packages.map(\.name)
+        let packageByName = Dictionary(uniqueKeysWithValues: packages.map { ($0.name, $0) })
+        let packageNames = Set(orderedNames)
+        let baseOrder = Dictionary(uniqueKeysWithValues: brewManager.packages.enumerated().map { ($1.name, $0) })
+
+        func stableCompare(_ lhs: String, _ rhs: String) -> Bool {
+            let li = baseOrder[lhs] ?? Int.max
+            let ri = baseOrder[rhs] ?? Int.max
+            if li != ri { return li < ri }
+            return lhs < rhs
+        }
+
+        var childrenByNode: [String: [String]] = [:]
+        for name in orderedNames {
+            let deps = (brewManager.dependencyGraph[name] ?? [])
+                .filter { packageNames.contains($0) }
+                .sorted(by: stableCompare)
+            childrenByNode[name] = deps
+        }
+
+        let dependedUpon = Set(childrenByNode.values.flatMap { $0 })
+        var roots = orderedNames.filter { !dependedUpon.contains($0) }.sorted(by: stableCompare)
+        if roots.isEmpty {
+            roots = orderedNames.sorted(by: stableCompare)
+        }
+
+        func makeNode(_ name: String, path: Set<String>) -> DependencyTreeNode? {
+            guard let pkg = packageByName[name] else { return nil }
+            if path.contains(name) {
+                return DependencyTreeNode(package: pkg, children: [])
+            }
+
+            let nextPath = path.union([name])
+            let children = (childrenByNode[name] ?? []).compactMap { makeNode($0, path: nextPath) }
+            return DependencyTreeNode(package: pkg, children: children)
+        }
+
+        var built = Set<String>()
+        var nodes: [DependencyTreeNode] = []
+        for root in roots {
+            guard !built.contains(root), let node = makeNode(root, path: []) else { continue }
+            built.insert(root)
+            nodes.append(node)
+        }
+        for name in orderedNames.sorted(by: stableCompare) where !built.contains(name) {
+            guard let node = makeNode(name, path: []) else { continue }
+            built.insert(name)
+            nodes.append(node)
+        }
+
+        return nodes
+    }
+
     /// Shows the list of outdated packages grouped by type, each group with a
     /// SelectAll toggle, plus a global SelectAll toggle at the top.
     private var packageSelectionView: some View {
         VStack(alignment: .leading, spacing: Constants.UI.contentPadding) {
+/*
+            // Disable dependency tree view for now
+            if !selectedDependencyTreeSections.isEmpty {
+                dependencyTreeView
+            }
+*/
             // Global select-all toggle
             Toggle(isOn: Binding(
                 get: { brewManager.allSelected },
@@ -128,8 +240,6 @@ struct MenuBarView: View {
                     .fontWeight(.medium)
             }
             .toggleStyle(.checkbox)
-
-            Divider()
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
@@ -181,17 +291,85 @@ struct MenuBarView: View {
                     }
                 }
             }
-            .frame(maxHeight: 250)
+            .frame(maxHeight: Constants.UI.popoverHeight - 60) // Leave space for the Update button at the bottom
 
             // Update button
             Button(action: {
-                Task { await brewManager.updateSelectedPackages() }
+                showingUpdateModeDialog = true
             }) {
                 Text(L10n.Menu.updateSelected)
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .disabled(brewManager.selectedPackages.isEmpty || brewManager.state == .updating)
+        }
+        .frame(maxHeight: Constants.UI.popoverHeight - 60) // Leave space for the Update button at the bottom
+    }
+
+    // MARK: - Dependency Tree View
+
+    /// Shows the dependency tree for the currently selected packages, grouped by type.
+    private var dependencyTreeView: some View {
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(selectedDependencyTreeSections, id: \.type) { section in
+                    let isExpanded = expandedDependencyTypes.contains(section.type)
+
+                    VStack(alignment: .leading, spacing: 0) {
+                        HStack(spacing: 6) {
+                            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .frame(width: 10)
+
+                            Text(L10n.Menu.dependencyTreeForType(L10n.Menu.packageTypeName(section.type)))
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+
+                            Spacer()
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                if isExpanded {
+                                    expandedDependencyTypes.remove(section.type)
+                                } else {
+                                    expandedDependencyTypes.insert(section.type)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 2)
+
+                        if isExpanded {
+                            ScrollView(.vertical) {
+                                VStack(alignment: .leading, spacing: 0) {
+                                    ForEach(Array(section.roots.indices), id: \.self) { index in
+                                        let root = section.roots[index]
+                                        DependencyTreeNodeRows(
+                                            node: root,
+                                            ancestorContinuations: [],
+                                            isLast: index == section.roots.count - 1,
+                                            isRoot: true
+                                        )
+                                    }
+                                }
+                                .frame(maxWidth: Constants.UI.popoverWidth - (2 * Constants.UI.contentPadding) - 32, alignment: .leading)
+                                .padding(8)
+                            }
+                            .frame(maxHeight: Constants.UI.popoverHeight)
+                            .padding(.leading, 16)
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+
+                if !selectedDependencyCycleNodes.isEmpty {
+                    Text(L10n.Menu.dependencyCycleWarning(selectedDependencyCycleNodes.joined(separator: ", ")))
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 
@@ -221,8 +399,75 @@ struct MenuBarView: View {
                     }
                 }
             }
+            .padding(.trailing, 12)
         }
-        .frame(maxHeight: 300)
+        .frame(maxHeight: Constants.UI.popoverHeight - 60) // Leave space for the Update button at the bottom
+    }
+}
+
+private struct DependencyTreeNode: Identifiable {
+    let package: BrewPackage
+    let children: [DependencyTreeNode]
+
+    var id: String { package.id }
+}
+
+@MainActor
+private struct DependencyTreeNodeRows: View {
+    let node: DependencyTreeNode
+    let ancestorContinuations: [Bool]
+    let isLast: Bool
+    let isRoot: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                ForEach(Array(ancestorContinuations.indices), id: \.self) { index in
+                    let hasContinuation = ancestorContinuations[index]
+                    Rectangle()
+                        .fill(hasContinuation ? Color.secondary.opacity(0.25) : Color.clear)
+                        .frame(width: 1, height: 14)
+                        .frame(width: 10)
+                }
+
+                if !isRoot {
+                    HStack(spacing: 0) {
+                        Rectangle()
+                            .fill(!isLast ? Color.secondary.opacity(0.25) : Color.clear)
+                            .frame(width: 1, height: 14)
+
+                        Rectangle()
+                            .fill(Color.secondary.opacity(0.35))
+                            .frame(width: 9, height: 1)
+                    }
+                    .frame(width: 10, height: 14)
+                }
+
+                Image(systemName: node.package.type == Constants.PackageType.cask ? "app.fill" : "shippingbox.fill")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Text(node.package.name)
+                    .font(.caption)
+
+                Spacer(minLength: 4)
+
+                Text("\(node.package.installedVersion) → \(node.package.availableVersion)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.vertical, 2)
+
+            ForEach(Array(node.children.indices), id: \.self) { index in
+                let child = node.children[index]
+                DependencyTreeNodeRows(
+                    node: child,
+                    ancestorContinuations: ancestorContinuations + [!isLast],
+                    isLast: index == node.children.count - 1,
+                    isRoot: false
+                )
+            }
+        }
     }
 }
 
@@ -282,12 +527,16 @@ struct PackageResultRow: View {
                 Text(result.log)
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(nil)
+                    .frame(maxWidth: Constants.UI.popoverWidth - (2 * Constants.UI.contentPadding) - 32, alignment: .leading)
                     .textSelection(.enabled)
-                    .padding(.leading, 16)
+                    .padding(8)
+                    .padding(.leading, 8)
                     .padding(.vertical, 4)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .frame(maxHeight: Constants.UI.popoverHeight - 60) // Leave space for the Update button at the bottom
     }
 }
 
@@ -297,11 +546,13 @@ struct PackageResultRow: View {
 @MainActor
 struct CheckLogRow: View {
     let log: String
+    let lastChecked: Date?
     @State private var isExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
+
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                     .font(.caption2)
                     .foregroundColor(.secondary)
@@ -312,6 +563,25 @@ struct CheckLogRow: View {
                     .foregroundColor(.secondary)
 
                 Spacer()
+    
+                // Display last check time if available
+                if let lastChecked = lastChecked {
+                    Text(
+                        L10n.Log.lastChecked +
+                            lastChecked.formatted(
+                                .dateTime
+                                    .year()
+                                    .month()
+                                    .day()
+                                    .hour(.twoDigits(amPM: .omitted))
+                                    .minute(.twoDigits)
+                                    .second(.twoDigits)
+                                    .timeZone()
+                            )
+                    )
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
             .contentShape(Rectangle())
             .onTapGesture {
@@ -322,14 +592,20 @@ struct CheckLogRow: View {
             .padding(.vertical, 2)
 
             if isExpanded {
-                Text(log)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .padding(.leading, 16)
-                    .padding(.vertical, 4)
+                ScrollView(.vertical) {
+                    Text(log)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(nil)
+                        .frame(maxWidth: Constants.UI.popoverWidth - (2 * Constants.UI.contentPadding) - 32, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
+                }
+                .padding(.leading, 16)
+                .padding(.vertical, 4)
             }
         }
+        .frame(maxHeight: isExpanded ? Constants.UI.popoverHeight - 60 : nil)
     }
 }
+

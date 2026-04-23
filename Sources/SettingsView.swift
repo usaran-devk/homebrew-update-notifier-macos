@@ -11,6 +11,7 @@ struct SettingsView: View {
     @State private var hasStoredPassword: Bool
     @State private var passwordError: String?
     @State private var passwordErrorDetails: String?
+    @State private var didLoadStoredPassword = false
 
     /// Callback invoked when settings are saved, passing the new interval.
     let onSave: (Int) -> Void
@@ -24,7 +25,7 @@ struct SettingsView: View {
         _autostartEnabled = State(initialValue: settings.autostartEnabled)
         _greedyEnabled = State(initialValue: settings.greedyEnabled)
         _savedPasswordEnabled = State(initialValue: settings.savedPasswordEnabled)
-        _hasStoredPassword = State(initialValue: KeychainHelper.hasStoredPassword())
+        _hasStoredPassword = State(initialValue: false)
         _passwordError = State(initialValue: nil)
         self.onSave = onSave
         self.onClose = onClose
@@ -84,6 +85,18 @@ struct SettingsView: View {
                 } header: {
                     Text(L10n.Settings.sectionGeneral)
                 }
+
+                Section {
+                    Text(L10n.Settings.appManagementHint)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Button(L10n.Settings.openAppManagementSettings) {
+                        openAppManagementSettings()
+                    }
+                    .buttonStyle(.bordered)
+                } header: {
+                    Text(L10n.Settings.sectionPermissions)
+                }
             }
             .formStyle(.grouped)
 
@@ -105,9 +118,21 @@ struct SettingsView: View {
             .padding()
         }
         .frame(width: Constants.UI.settingsWidth, height: Constants.UI.settingsHeight)
+        .onAppear {
+            loadStoredPasswordOnce()
+        }
     }
 
     // MARK: - Private
+
+    /// Loads keychain state once when the settings view first appears.
+    /// Keeping this out of `init` avoids duplicate keychain prompts caused by
+    /// multiple view initializations during SwiftUI rendering.
+    private func loadStoredPasswordOnce() {
+        guard !didLoadStoredPassword else { return }
+        didLoadStoredPassword = true
+        hasStoredPassword = KeychainHelper.hasStoredPassword()
+    }
 
     private func save() {
         let minutes = Int(intervalMinutes) ?? Constants.Defaults.checkIntervalMinutes
@@ -167,6 +192,13 @@ struct SettingsView: View {
             hasStoredPassword = true
         } catch {
             passwordError = L10n.Settings.passwordSaveError
+        }
+    }
+
+    /// Opens Privacy & Security › App Management in macOS System Settings.
+    private func openAppManagementSettings() {
+        if let url = URL(string: Constants.URLs.appManagementSettings) {
+            NSWorkspace.shared.open(url)
         }
     }
 
